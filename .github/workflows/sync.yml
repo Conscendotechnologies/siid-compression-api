@@ -1,0 +1,74 @@
+name: Sync types from source
+
+# Mirrors extensions/siid-compression/api/ from the SOURCE monorepo into this repo's root, so
+# external pnpm consumers can `pnpm add github:Conscendotechnologies/siid-compression-api` without
+# cloning the whole VS Code fork.
+#
+# No PAT needed while the source repo is PUBLIC: the clone is anonymous, and the push is to THIS
+# repo (built-in GITHUB_TOKEN). If the source ever goes private, see MAINTAINING notes below.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 6 * * *" # daily 06:00 UTC
+  # Optional: fire from the source repo on api/ changes via a repository_dispatch of this type.
+  repository_dispatch:
+    types: [siid-compression-api-changed]
+
+permissions:
+  contents: write # allow pushing the synced files back to this repo
+
+env:
+  SOURCE_REPO: Conscendotechnologies/Siid
+  SOURCE_BRANCH: siid-compression-node-proxy # branch holding the compression extension
+  SOURCE_SUBDIR: extensions/siid-compression/api
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this (mirror) repo
+        uses: actions/checkout@v4
+
+      - name: Fetch api/ from the public source repo
+        run: |
+          set -eu
+          # Sparse, shallow clone of ONLY the api subdir from the public source (no token needed).
+          rm -rf .src
+          git clone --depth 1 --filter=blob:none --sparse \
+            --branch "$SOURCE_BRANCH" "https://github.com/${SOURCE_REPO}.git" .src
+          cd .src
+          git sparse-checkout set "$SOURCE_SUBDIR"
+          cd ..
+          test -d ".src/${SOURCE_SUBDIR}" || { echo "source subdir missing"; exit 1; }
+
+      - name: Copy types into repo root
+        run: |
+          set -eu
+          # Copy the shippable files; keep this repo's own workflow + git metadata.
+          cp -f ".src/${SOURCE_SUBDIR}/index.d.ts" ./index.d.ts
+          cp -f ".src/${SOURCE_SUBDIR}/siid-compression.d.ts" ./siid-compression.d.ts
+          cp -f ".src/${SOURCE_SUBDIR}/package.json" ./package.json
+          cp -f ".src/${SOURCE_SUBDIR}/README.md" ./README.md
+          # Rewrite the package.json repository to point at THIS mirror repo (consumers install from here).
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.repository={type:'git',url:'https://github.com/Conscendotechnologies/siid-compression-api.git'};delete p.directory;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n');"
+          rm -rf .src
+
+      - name: Commit & push if changed
+        run: |
+          set -eu
+          git config user.name "siid-sync-bot"
+          git config user.email "actions@github.com"
+          if git diff --quiet -- index.d.ts siid-compression.d.ts package.json README.md; then
+            echo "No changes to sync."
+            exit 0
+          fi
+          VER=$(node -e "process.stdout.write(require('./package.json').version)")
+          git add index.d.ts siid-compression.d.ts package.json README.md
+          git commit -m "sync: types from ${SOURCE_REPO}@${SOURCE_BRANCH} (v${VER})"
+          git push
+          # Tag the version if the tag doesn't already exist (lets consumers pin #v<version>).
+          if ! git rev-parse "v${VER}" >/dev/null 2>&1; then
+            git tag "v${VER}"
+            git push --tags
+          fi
